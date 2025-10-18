@@ -60,8 +60,8 @@ void setup()
 {
   Serial.begin(9600);
 
-  lcd.init();
   thermocouple.init();
+  lcd.init();
 
   // Configure relay output
   pinMode(RELAY_OUTPUT_PIN, OUTPUT);
@@ -137,8 +137,8 @@ void loop()
       }
     }
 
-    // lcd.plot_temperature_reading(temp_reading, (pwm_output / 255.0f));
+    lcd.plot_temperature_reading(temp_reading, (pwm_output / 255.0f));
   }
 
-  // lcd.poll_touchscreen();
+  lcd.poll_touchscreen();
 }
