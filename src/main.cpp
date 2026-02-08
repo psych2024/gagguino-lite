@@ -3,28 +3,26 @@
 #include <Arduino.h>
 #include "lcd/lcd.h"
 #include "PID_v1.h"
+#include "globals.h"
 #include "thermocouple/thermocouple.h"
 
 #define RELAY_OUTPUT_PIN 6
+#define RELAY_LOW LOW
+#define RELAY_HIGH HIGH
 
-// PID Constants
-#define HEATER_KP 3.5
-#define HEATER_KI 0.2
-#define HEATER_KD 30.0
+GagguinoMode MODE = INVALID;
 
-// Timing Constants
-#define PID_PERIOD_MS 500 // 2Hz PWM frequency
-#define REPORTING_PERIOD_MS 1000
-
-// Variables
-double temp_setpoint, temp_reading, pwm_output;
-unsigned long pwmPreviousMillis = 0;
-unsigned long tempPreviousMillis = 0;
+// Variable
+double temp_reading = -1;
+double temp_setpoint, pwm_output;
+unsigned long relayPrevMills = 0;
+unsigned long reportingPrevMills = 0;
+unsigned long pidPrevMills = 0;
+unsigned long pwmPrevMills = 0;
 Thermocouple thermocouple;
 
-unsigned long relayOnSince = 0;
-bool relayIsOn = false;
-unsigned long heaterOnTime = 0;
+unsigned long relayOnTime = 0;
+bool relayOn = false;
 
 enum RoastLevel
 {
@@ -34,10 +32,9 @@ enum RoastLevel
   GENERAL
 };
 RoastLevel level = GENERAL;
-GagguinoMode mode = BREW;
 
 // PID Controller
-PID pid(&temp_reading, &pwm_output, &temp_setpoint, HEATER_KP, HEATER_KI, HEATER_KD, P_ON_E, DIRECT);
+PID pid(&temp_reading, &pwm_output, &temp_setpoint, 0, 0, 0, P_ON_E, DIRECT);
 
 float get_temp_setpoint_for_roast(RoastLevel level)
 {
@@ -56,22 +53,76 @@ float get_temp_setpoint_for_roast(RoastLevel level)
 
 LCD lcd;
 
+void setGlobalMode(GagguinoMode new_mode) {
+  if (MODE == new_mode) return;
+
+  if (new_mode == INVALID) {
+    lcd.clear_screen();
+    
+    pid.SetMode(MANUAL);
+    pwm_output = 0;
+
+  } else if (new_mode == WARMUP) {
+    lcd.draw_loading_screen();
+    lcd.update_warmup_status(0);
+
+    pid.SetMode(MANUAL);
+
+  } else if (new_mode == BREW) {
+    lcd.plot_temp_graph(BREW);
+    temp_setpoint = get_temp_setpoint_for_roast(GENERAL);
+
+    pid.SetMode(MANUAL);
+    pwm_output = 0;
+    pid.SetTunings(BREW_KP, BREW_KI, BREW_KD);
+
+  } else if (new_mode == STEAM) {
+    lcd.plot_temp_graph(STEAM);
+    temp_setpoint = STEAM_TEMP_SETPOINT;
+
+    pid.SetMode(MANUAL);
+    pwm_output = 0;
+    pid.SetTunings(STEAM_KP, STEAM_KI, STEAM_KD);
+  }
+  
+  MODE = new_mode;
+}
+
+void update_temperature(void) {
+  double new_reading = thermocouple.readCelsius();
+  if (isnan(new_reading)) {
+    setGlobalMode(INVALID);
+    return;
+  }
+
+  if (MODE == INVALID) {
+    setGlobalMode(WARMUP);
+  }
+
+  if (temp_reading < 0) {
+    temp_reading = new_reading;
+    return;
+  }
+
+  temp_reading = EMA_ALPHA * new_reading + (1.0 - EMA_ALPHA) * temp_reading;
+}
+
 void setup()
 {
-  Serial.begin(9600);
+  Serial.begin(115200);
 
   thermocouple.init();
   lcd.init();
 
   // Configure relay output
   pinMode(RELAY_OUTPUT_PIN, OUTPUT);
-  digitalWrite(RELAY_OUTPUT_PIN, LOW); // Ensure relay starts OFF
+  digitalWrite(RELAY_OUTPUT_PIN, RELAY_LOW); // Ensure relay starts OFF
 
   // Initialize PID
-  temp_setpoint = get_temp_setpoint_for_roast(GENERAL);
-  pid.SetOutputLimits(0, 255);
+  pid.SetOutputLimits(0, PWM_WINDOW_MS);
   pid.SetSampleTime(PID_PERIOD_MS);
-  pid.SetMode(AUTOMATIC);
+
+  setGlobalMode(WARMUP);
 
   Serial.println("Setup Complete");
 }
@@ -80,65 +131,92 @@ void loop()
 {
   unsigned long currentMillis = millis();
 
-
-  // // Compute PID output at regular intervals
-  if (currentMillis - pwmPreviousMillis >= PID_PERIOD_MS)
-  {
-    pwmPreviousMillis = currentMillis;
-
-    pid.Compute();
-
-    // Calculate how long to keep the relay ON (burst fire)
-    heaterOnTime = static_cast<unsigned long>((pwm_output / 255.0f) * PID_PERIOD_MS);
-
-    if (heaterOnTime > 0)
-    {
-      digitalWrite(RELAY_OUTPUT_PIN, HIGH);
-      relayOnSince = currentMillis;
-      relayIsOn = true;
+  if (currentMillis - pidPrevMills >= PID_PERIOD_MS) {
+    pidPrevMills = currentMillis;
+    update_temperature();
+    
+    if (temp_reading >= WARMUP_THRESHOLD_CELCIUS && MODE == WARMUP) {
+      setGlobalMode(BREW);
     }
-    else
-    {
-      digitalWrite(RELAY_OUTPUT_PIN, LOW);
-      relayIsOn = false;
+    pid.Compute();
+  }
+
+
+  if (currentMillis - pwmPrevMills >= PWM_WINDOW_MS) {
+    pwmPrevMills = currentMillis;
+
+    if (MODE == INVALID) {
+      relayOnTime = 0;
+    } else if (MODE == WARMUP) {
+      relayOnTime = PWM_WINDOW_MS;
+    } else {
+      // add 0.3 as hysteresis
+      // if (temp_setpoint - temp_reading >= PID_BLEND_DELTA_LO + 0.3) {
+      //   pid.SetMode(MANUAL);
+      // }
+
+      if (temp_setpoint - temp_reading < PID_BLEND_DELTA_LO) {
+        pid.SetMode(AUTOMATIC);
+      }
+
+      if (temp_reading >= temp_setpoint - PID_BLEND_DELTA_HI) {
+          relayOnTime = static_cast<unsigned long>(pwm_output);
+      } else {
+        float alpha = ((temp_setpoint - PID_BLEND_DELTA_HI) - temp_reading) / float(PID_BLEND_DELTA_LO - PID_BLEND_DELTA_HI);
+        alpha = min(alpha, 1.0);
+        alpha = max(0, alpha);
+
+        relayOnTime = alpha * PWM_WINDOW_MS + (1.0f - alpha) * pwm_output;
+      }
+    }
+
+    relayPrevMills = currentMillis;
+    if (relayOnTime > 0) {
+      digitalWrite(RELAY_OUTPUT_PIN, RELAY_HIGH);
+      relayOn = true;
+    } else {
+      digitalWrite(RELAY_OUTPUT_PIN, RELAY_LOW);
+      relayOn = false;
     }
   }
 
   // If the relay is ON and it's been on long enough, turn it OFF
-  if (relayIsOn && (currentMillis - relayOnSince >= heaterOnTime))
-  {
-    digitalWrite(RELAY_OUTPUT_PIN, LOW);
-    relayIsOn = false;
+  if (relayOn && (currentMillis - relayPrevMills >= relayOnTime)) {
+    digitalWrite(RELAY_OUTPUT_PIN, RELAY_LOW);
+    relayOn = false;
   }
 
   // Periodic reporting
-  if (currentMillis - tempPreviousMillis >= REPORTING_PERIOD_MS)
-  {
-    tempPreviousMillis = currentMillis;
-
-    temp_reading = thermocouple.readCelsius();
-    if (isnan(temp_reading)) {
-      Serial.println("Error temp reading!");
+  if (currentMillis - reportingPrevMills >= REPORTING_PERIOD_MS) {
+    reportingPrevMills = currentMillis;
+    
+    if (temp_reading == -1) {
+      Serial.println(F("Error temp reading!"));
     } else {
-      Serial.print("Temp: ");
       Serial.print(temp_reading);
-      Serial.print("°C | Setpoint: ");
-      Serial.print(temp_setpoint);
-      Serial.print("°C | PID Output: ");
-      Serial.println(pwm_output);
+      Serial.print(" ");
+      Serial.println(float(relayOnTime / PWM_WINDOW_MS) * 100);
     }
     
-    GagguinoMode curr_mode = lcd.get_gagguino_mode();
-    if (curr_mode != mode) {
-      if (curr_mode == BREW) {
-        temp_setpoint = 93.f;
-      } else {
-        temp_setpoint = 123.f;
-      }
+    if (lcd.check_toggled_mode()) {
+      Serial.println(F("MODE CHANGE"));
+      lcd.display_mode(MODE, ILI9341_BLACK);
+      if (MODE == BREW)
+          setGlobalMode(STEAM);
+      else
+          setGlobalMode(BREW);
+      lcd.display_mode(MODE, ILI9341_WHITE);
     }
 
-    lcd.plot_temperature_reading(temp_reading, (pwm_output / 255.0f));
+    if (MODE == INVALID) {
+      lcd.clear_screen();
+    } else if (MODE == WARMUP) {
+      float status = (temp_reading / WARMUP_THRESHOLD_CELCIUS) * 100;
+      lcd.update_warmup_status(static_cast<uint8_t>(status));
+    } else {
+      lcd.plot_temperature_reading(MODE, temp_reading, static_cast<uint16_t>((relayOnTime / PWM_WINDOW_MS) * 100));
+    }
   }
 
-  lcd.poll_touchscreen();
+  if (MODE > WARMUP) lcd.poll_touchscreen();
 }
